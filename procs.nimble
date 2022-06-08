@@ -3,3 +3,5 @@ author      = "quantimnot"
 description = "Cross-platform process utilities"
 license     = "MIT"
 srcDir      = "."
+
+requires "osstat"

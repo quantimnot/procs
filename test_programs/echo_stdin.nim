@@ -1,0 +1,1 @@
+echo readAll(stdin)
