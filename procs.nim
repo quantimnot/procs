@@ -8,7 +8,7 @@
 #* TODO:
 #*   - [X] workaround issue of `fgetc` blocking in thread
 #*         I worked around it by setting the `O_NONBLOCK` flag on the handles
-#*   - [ ] determine if blocking io problem is mine
+#*   - [X] determine if blocking io problem is mine
 #*   - [ ] Learn from these:
 #*     - [ ] https://github.com/cheatfate/asynctools/blob/master/asynctools/asyncproc.nim
 #*     - [X] https://github.com/disruptek/golden/blob/master/src/golden/invoke.nim
@@ -18,28 +18,47 @@
 #*     - [ ] https://github.com/status-im/nim-chronos/issues/77
 #*     - [ ] https://github.com/nim-lang/Nim/labels/osproc
 #******
+import std/[selectors, osproc, options, strutils, streams, monotimes, posix, os]
 
-import std/[selectors, osproc, options]
-import strutils
-# import asyncdispatch
-# import asyncfutures
-import streams
-import times
-
+import pkg/sys/[handles, pipes]
 import pkg/foreach
+
 import pkg/platforms
 
 export osproc
 
+const
+  useProcessSignal {.booldefine.} = true
+
 type
-  Handler* = proc(o:string) {.nimcall.}
-  Pipe* = ref object
-  Pid* = distinct int
-  Config* = object
-  ExecOut* = tuple
-    exitCode: int
-    output: string
-    error: string
+  #****t* procs/ErrorResp
+  HandlerResp {.pure.} = enum
+    ## PURPOSE
+    Unregister, Ignore
+   #******
+  LimitKind* {.pure.} = enum
+    Duration
+  LimitHandler = proc(limit: LimitKind) {.closure.}
+  Handler = proc() {.closure.}
+  ErrorHandler = proc(code: OSErrorCode): HandlerResp {.closure.}
+  Handlers* = tuple
+    process, stdout, stderr:
+      tuple[handle: FD, onEvent: Handler, onError: ErrorHandler]
+
+  Limits* = object
+    duration*: int
+    grace*: int
+    onLimit*: LimitHandler
+
+  Invocation* = object
+    process*: Process
+    handlers*: Handlers
+
+  #****t* procs/ProcEvent
+  ProcEvent* {.pure.} = enum
+    ## PURPOSE
+    StdIn, StdOut, StdErr, Quit
+  #******
 
 # func initConfig*(): Config =
 #   discard
@@ -68,20 +87,15 @@ type
 #   config: Config = initConfig(),
 #   workDir: string = ""): ExecOut
 
-#****t* procs/Monitor
-## PURPOSE
-##   Tools and experiments in process managment.
-type
-  Monitor = enum
-    Output = "the process has some data for us on stdout"
-    Errors = "the process has some data for us on stderr"
-    Finished = "the process has finished"
-#******
+func isValid(fd: FD): bool =
+  fd != InvalidFD
 
 #****f* procs/monitor
-proc monitor*(process: Process; stdout, stderr: Handler; deadline = -1.0): int {.effectsOf: [stdout, stderr].} =
+proc monitor*(arg: tuple[invok: Invocation, limits: Limits]): int {.effectsOf: [arg].} =
   ## PURPOSE
-  ##   Monitor the `stdio` and `stderr` file handles for data.
+  ##   Monitor `stdio` and `stderr` for data to read.
+  ##   Monitor for termination.
+  ##   Monitor resource limits.
   ## ATTRIBUTION
   ##   Derived from @disruptek's https://github.com/disruptek/golden/blob/master/src/golden/invoke.nim
   ## DESCRIPTION
@@ -91,140 +105,123 @@ proc monitor*(process: Process; stdout, stderr: Handler; deadline = -1.0): int {
   #* TODO
   #*   - cleanup
   #*
+  template process: untyped = arg.invok.handlers.process
+  template stdout: untyped = arg.invok.handlers.stdout
+  template stderr: untyped = arg.invok.handlers.stderr
 
-  proc toString(str: openArray[char], len = -1): string =
-    result = newStringOfCap(len(str))
-    for ch in str:
-      add(result, ch)
+  # proc toString(str: openArray[char], len = -1): string =
+  #   result = newStringOfCap(len(str))
+  #   for ch in str:
+  #     add(result, ch)
 
-  proc drainStreamInto(stream: Stream; handler: Handler) =
-    var output: string
-    while not stream.atEnd:
-      output &= stream.readChar
-    handler(output)
+  # proc drainStreamInto(stream: Stream; handler: Handler) =
+  #   var output: string
+  #   while not stream.atEnd:
+  #     output &= stream.readChar
+  #   handler(output)
 
-  proc drainStreamInto(stream: Stream; output: File | Stream) =
-    while not stream.atEnd:
-      output.write stream.readChar
+  # proc drainStreamInto(stream: Stream; output: File | Stream) =
+  #   while not stream.atEnd:
+  #     output.write stream.readChar
 
-  proc drain(ready: ReadyKey; stream: Stream; handler: Handler) =
-    if Event.Read in ready.events:
-      stream.drainStreamInto(handler)
-    elif {Event.Error} == ready.events:
-      stream.drainStreamInto(handler)
-    else:
-      assert ready.events.card == 0
+  # proc drain(ready: ReadyKey; stream: Stream; handler: Handler) =
+  #   if Event.Read in ready.events:
+  #     stream.drainStreamInto(handler)
+  #   elif {Event.Error} == ready.events:
+  #     stream.drainStreamInto(handler)
+  #   else:
+  #     assert ready.events.card == 0
 
-  proc drain(ready: ReadyKey; stream: Stream; output: File | Stream) =
-    if Event.Read in ready.events:
-      stream.drainStreamInto(output)
-    elif {Event.Error} == ready.events:
-      stream.drainStreamInto(output)
-    else:
-      assert ready.events.card == 0
+  # proc drain(ready: ReadyKey; stream: Stream; output: File | Stream) =
+  #   if Event.Read in ready.events:
+  #     stream.drainStreamInto(output)
+  #   elif {Event.Error} == ready.events:
+  #     stream.drainStreamInto(output)
+  #   else:
+  #     assert ready.events.card == 0
 
   var
     timeout = 1  # start with a timeout in the future
     # clock = getTime()
-    watcher = newSelector[Monitor]()
+    watcher = newSelector[ProcEvent]()
 
-  # I set these to prevent `f_getc` from blocking.
-  # I don't know if this is the right thing to do.
-  discard process.outputHandle.setNonBlock
-  discard process.errorHandle.setNonBlock
+  stdout.handle.setBlocking false
+  stderr.handle.setBlocking false
 
   # monitor whether the process has finished or produced output
-  when defined(useProcessSignal):
-    let signal = watcher.registerProcess(process.processId, Finished)
-  if not stdout.isNil:
-    watcher.registerHandle(process.outputHandle.int, {Event.Read}, Output)
-  if not stderr.isNil:
-    watcher.registerHandle(process.errorHandle.int, {Event.Read}, Errors)
+  when useProcessSignal:
+    watcher.registerProcess(process.handle.int, Quit)
+  if stdout.handle.isValid:
+    watcher.registerHandle(stdout.handle.int, {Error, Read}, StdOut)
+  if stderr.handle.isValid:
+    watcher.registerHandle(stderr.handle.int, {Error, Read}, StdErr)
 
   block running:
     try:
       while true:
-        # if deadline <= 0.0:
-        #   timeout = -1  # wait forever if no deadline is specified
-        # # otherwise, reset the timeout if it hasn't passed
-        # elif timeout > 0:
-        #   # cache the current time
-        #   let rightNow = epochTime()
-        #   block checktime:
-        #     # we may break the checktime block before setting timeout to -1
-        #     if rightNow < deadline:
-        #       # the number of ms remaining until the deadline
-        #       timeout = int( 1000 * (deadline - rightNow) )
-        #       # if there is time left, we're done here
-        #       if timeout > 0:
-        #         break checktime
-        #       # otherwise, we'll fall through, setting the timeout to -1
-        #       # which will cause us to kill the process...
-        #     timeout = -1
-        # # if there's a deadline in place, see if we've passed it
-        # if deadline > 0.0 and timeout < 0:
-        #   # the deadline has passed; kill the process
-        #   process.terminate
-        #   process.kill
-        #   # wait for it to exit so that we pass through the loop below only one
-        #   # additional time.
-        #   #
-        #   # if the process is wedged somehow, we will not continue to spawn more
-        #   # invocations that will DoS the machine.
-        #   invocation.code = process.waitForExit
-        #   # make sure we catch any remaining output and
-        #   # perform the expected measurements
-        #   timeout = 0
+        template duration: untyped = arg.limits.duration
+        if duration <= 0:
+          timeout = -1  # wait forever if no deadline is specified
+        # otherwise, reset the timeout if it hasn't passed
+        elif timeout > 0:
+          # cache the current time
+          let rightNow = getMonoTime().ticks
+          block checktime:
+            # we may break the checktime block before setting timeout to -1
+            if rightNow < duration:
+              # the number of ms remaining until the deadline
+              timeout = int( 1000 * (duration - rightNow) )
+              # if there is time left, we're done here
+              if timeout > 0:
+                break checktime
+              # otherwise, we'll fall through, setting the timeout to -1
+              # which will cause us to kill the process...
+            timeout = -1
+        # if there's a deadline in place, see if we've passed it
+        if duration > 0 and timeout < 0:
+          # the deadline has passed; kill the process
+          if arg.limits.onLimit != nil:
+            arg.limits.onLimit(Duration)
+          else:
+            arg.invok.process.terminate
+            arg.invok.process.kill
+          # wait for it to exit so that we pass through the loop below only one
+          # additional time.
+          #
+          # if the process is wedged somehow, we will not continue to spawn more
+          # invocations that will DoS the machine.
+            return arg.invok.process.waitForExit
+          # make sure we catch any remaining output and
+          # perform the expected measurements
+          # timeout = 0
         let events = watcher.select(timeout)
         foreach ready in events.items of ReadyKey:
-          var kind: Monitor = watcher.getData(ready.fd)
+          var kind = watcher.getData(ready.fd)
           case kind:
-          of Output:
-            # keep the output stream from blocking
-            ready.drain(process.outputStream, stdout)
-          of Errors:
-            # keep the errors stream from blocking
-            ready.drain(process.errorStream, stderr)
-          of Finished:
-            # check the clock and cpu early
-            # cpuPreWait(gold, invocation)
-            # invocation.wall = getTime() - clock
-            # drain any data in the streams
-            if not stdout.isNil:
-              process.outputStream.drainStreamInto(stdout)
-            if not stderr.isNil:
-              process.errorStream.drainStreamInto(stderr)
+          of StdOut:
+            if Read in ready.events:
+              stdout.onEvent()
+            if Error in ready.events:
+              if stdout.onError(ready.errorCode) == Unregister:
+                watcher.unregister(ready.fd)
+          of StdErr:
+            if Read in ready.events:
+              stderr.onEvent()
+            if Error in ready.events:
+              if stderr.onError(ready.errorCode) == Unregister:
+                watcher.unregister(ready.fd)
+          of Quit:
+            process.onEvent()
             break running
-        when not defined(useProcessSignal):
-          if process.peekExitCode != -1:
-            # check the clock and cpu early
-            # cpuPreWait(gold, invocation)
-            # invocation.wall = getTime() - clock
-            if not stdout.isNil:
-              process.outputStream.drainStreamInto(stdout)
-            if not stderr.isNil:
-              process.errorStream.drainStreamInto(stderr)
+          of StdIn: discard
+        when not useProcessSignal:
+          if arg.process.peekExitCode != -1:
+            process.onEvent()
             break
-        if deadline >= 0:
+        if duration >= 0:
           assert timeout > 0, "terminating process failed measurements"
     except IOSelectorsException as e:
-      # merely report errors for database safety
       stdmsg().writeLine "error talkin' to process: " & e.msg
-
-  try:
-    # cleanup the selector
-    when defined(useProcessSignal) and not defined(debugFdLeak):
-      watcher.unregister signal
-    watcher.close
-  except Exception as e:
-    # merely report errors for database safety
-    stdmsg().writeLine e.msg
-
-  # the process has exited, but this could be useful to Process
-  # and in fact is needed for Rusage
-  process.waitForExit
-  # cpuPostWait(gold, invocation)
-#******
 
 when windows in platform.os.parents:
   include "."/procs_windows
@@ -234,3 +231,11 @@ elif darwin in platform.os.parents:
   include "."/procs_darwin
 else:
   {.error: "platform not supported".}
+
+when isMainModule:
+  when defined test:
+    import unittests
+    suite "":
+      test "":
+        check:
+          discard
